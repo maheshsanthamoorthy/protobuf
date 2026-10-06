@@ -4,29 +4,29 @@
 #include <limits>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "absl/container/flat_hash_set.h"
 #include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "conformance/binary_wireformat.h"
 #include "conformance/conformance.pb.h"
 #include "conformance/test_runner.h"
 #include "google/protobuf/descriptor.h"
 
-// This file defines the APIs used by conformance tests to interact with
-// testees.  The structure of these APIs are intentionally decoupled from the
-// runner/testee protocol (which are used to implement them), in order to
-// maximize their flexibility in tests.
+// The APIs conformance tests use to interact with a testee.  They are
+// deliberately decoupled from the runner/testee protocol that implements
+// them.  That keeps them flexible for tests.
 //
-// Tests should not ever need to name any of these types directly, but will
-// obtain a Test object pointing to the global testee and pass the final
-// TestResult to one of our matchers.
+// Tests should never need to name any of these types directly.  A test
+// obtains a Test object for the global testee from Testee() (see
+// test_fixture.h), chains operations on it and passes the final
+// TestResult to Yields() (see matchers.h):
 //
-// Example:
-//
-// EXPECT_THAT(Testee()
-//                .ParseBinary(Wire(LengthPrefixedField(1, "foo"))
-//                .SerializeText({/*print_unknown_fields=*/true}),
-//             ParsedPayload(EqualsProto("pb(1: "foo")pb")));
+//   EXPECT_THAT(Testee()
+//                   .ParseBinary(TestAllTypesProto2::descriptor(), input)
+//                   .SerializeBinary(),
+//               Yields(WhenParsed(EqualsBinaryProto(input))));
 
 // TODO Possible future APIs to expand conformance coverage:
 // - Add ClearUnknownFields() to InMemoryMessage
@@ -50,7 +50,7 @@ namespace conformance {
 // "Recommended" (see PriorityLevelName()).
 //
 // A suite declares its priority with ConformanceTest::DefaultPriority().  A
-// single test overrides it with Testee(priority); see test_environment.h.
+// single test overrides it with Testee(priority); see test_fixture.h.
 // TODO: b/564550230 - rename the levels in test names to P0/P1 once every
 // suite has been triaged.
 enum class TestPriority { kP0 = 0, kP1 = 1 };
@@ -74,8 +74,14 @@ absl::string_view PriorityLevelName(TestPriority priority);
 
 namespace internal {
 
-// The final result of a conformance test, to be processed by a matcher.
-class TestResult {
+// The final result of a conformance test: the testee's response and what the
+// test asked of it.  Hand it to exactly one EXPECT_THAT(..., Yields(...)),
+// which records the outcome against the failure list (see matchers.h).
+// Dropping a result does not compile, and neither does a leaf matcher applied
+// to one without Yields() (see YieldedResult in matchers.h).  The test
+// environment fails a gtest test that runs a conformance test but never
+// checks its result in any other way (see Testee::tests_run()).
+class [[nodiscard]] TestResult {
  public:
   // The name of the test that was run, useful for failure matching and
   // reporting.
@@ -191,6 +197,13 @@ class Testee {
     return Test(this, name, priority);
   }
 
+  // The full names of the tests run so far, in the order they ran.  Each of
+  // them must be checked with Yields() (see matchers.h).
+  // ConformanceEnvironment (test_environment.h) compares this with the tests
+  // the TestManager has heard about and fails a gtest test that ran a
+  // conformance test but never checked its result.
+  absl::Span<const std::string> tests_run() const { return tests_run_; }
+
  private:
   ::conformance::ConformanceResponse Run(
       absl::string_view test_name,
@@ -199,6 +212,8 @@ class Testee {
 
   ConformanceTestRunner* runner_;
 
+  // The tests run so far, in order, and as a set for Run()'s duplicate check.
+  std::vector<std::string> tests_run_;
   absl::flat_hash_set<std::string> test_names_ran_;
 };
 

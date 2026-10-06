@@ -36,10 +36,43 @@ struct UnexpectedResult {
   absl::optional<std::string> matched_entry;
 };
 
+// How many tests one wildcard entry may cover with a verdict, that is an
+// expected failure or an unexpected success.  See OverexpandedWildcards().
+inline constexpr int kMaximumWildcardExpansions = 20;
+
+// The outcome of one conformance test, as Yields() (matchers.h) records it in
+// a gtest property named after the test and as the test environment replays
+// it (see TestManager::Report()).  The property value is ToString(), e.g.
+// "P0 PASS" or "P1 FAIL: Failed to parse input.".
+struct ResultRecord {
+  enum class Status {
+    kPass,   // The result matched the expectation.
+    kFail,   // It didn't.
+    kCrash,  // The testee hit a runtime error or timed out.
+    kSkip,   // The testee declined to run the test.
+  };
+
+  TestPriority priority;
+  Status status;
+  // The failure message or skip reason, if any.
+  std::string message;
+
+  // "<priority> <status>[: <message>]": the priority as PriorityName() spells
+  // it, the status as PASS, FAIL, CRASH or SKIP, and the message stripped of
+  // trailing whitespace and left out when empty.
+  std::string ToString() const;
+
+  // The inverse of ToString().  Returns nullopt for a value in any other
+  // form, such as a property a test recorded itself.
+  static absl::optional<ResultRecord> Parse(absl::string_view value);
+};
+
 // Tracks the expected failures and the actual results of a test suite.  The
-// conformance matchers (next CL) report the outcome of every test here.  The
-// test environment reads the results back and reports them as test
-// properties.  Under --fix the results also populate the new failure list.
+// failure list is loaded once.  Yields() (matchers.h) then asks for the
+// verdict on each result (see VerdictOnSuccess() and friends, which record
+// nothing), and the test environment replays the outcomes Yields() recorded
+// (see Report()).  The environment also reads the counters back as test
+// properties.  Under --fix the results populate the new failure list.
 class TestManager {
  public:
   TestManager() : expected_failure_list_("root") {}
@@ -64,43 +97,79 @@ class TestManager {
   // fails.
   absl::Status SaveFailureList(absl::string_view filename) const;
 
-  // Reports a successful test run.  This will return an error if the test was
-  // expected to fail.
+  // The verdict on a test that succeeded: an error naming the entry it
+  // matched if the test was expected to fail.  Records nothing.
+  absl::Status VerdictOnSuccess(absl::string_view test_name) const;
+
+  // The verdict on a test that failed with `failure_message`.  OK if the
+  // failure doesn't fail the suite.  That is the case when the test is in the
+  // failure list with a matching message (an expected failure), or when it
+  // isn't listed and `priority` is above the enforcement level (a tolerated
+  // failure).  Otherwise the failure is unexpected and the error says why.  A
+  // listed test is checked whatever its priority, so that the failure list
+  // can't go stale unnoticed.  The normalized actual message only needs to
+  // start with the expected message, so an empty expected message matches any
+  // failure.  Records nothing.
+  absl::Status VerdictOnFailure(absl::string_view test_name,
+                                TestPriority priority,
+                                absl::string_view failure_message) const;
+
+  // The verdict on a test the testee skipped for `skip_reason`: an error
+  // naming the entry it matched if the test is in the failure list, since a
+  // skipped test can't be an expected failure.  Whether that error fails the
+  // test is the caller's policy; Yields() fails such a test.  Records nothing.
+  absl::Status VerdictOnSkip(absl::string_view test_name,
+                             absl::string_view skip_reason) const;
+
+  // The failure list entry `test_name` matches, possibly a wildcard, if any.
+  // Records nothing.
+  absl::optional<std::string> MatchingEntry(absl::string_view test_name) const;
+
+  // Records a successful test run and returns VerdictOnSuccess().
   absl::Status ReportSuccess(absl::string_view test_name);
 
-  // Reports a failed test run along with the failure message.  Returns OK if
-  // the failure doesn't fail the suite.  That is the case when the test is in
-  // the failure list with a matching message (an expected failure, logged at
-  // INFO), or when it isn't listed and `priority` is above the enforcement
-  // level (a tolerated failure, logged as a WARNING and only counted by
-  // tolerated_failures()).  Otherwise the failure is unexpected and the error
-  // says why.  A listed test is checked whatever its priority, so that the
-  // failure list can't go stale unnoticed.  The normalized actual message
-  // only needs to start with the expected message, so an empty expected
-  // message matches any failure.
+  // Records a failed test run along with the failure message and returns
+  // VerdictOnFailure().  A tolerated failure is only counted (see
+  // tolerated_failures()).  An unexpected one is also kept for
+  // UnexpectedFailures() and SaveFailureList().
   absl::Status ReportFailure(absl::string_view test_name, TestPriority priority,
                              absl::string_view failure_message);
 
-  // Reports a test that the testee skipped for `skip_reason`.  A skip is not
-  // a verdict on the test's failure list entry, if any.  The entry counts as
-  // seen and matched, so that Finalize() doesn't report it and
-  // SaveFailureList() keeps it, but the skip is not an expected failure.  A
-  // listed test that is skipped is recorded (see ListedSkips()) and returns an
-  // error that names the matched entry, like an unexpected success.  Whether
-  // that error fails the test is the caller's policy.  The matchers, next CL,
-  // fail such a test.
+  // Records a test that the testee skipped for `skip_reason` and returns
+  // VerdictOnSkip().  A skip is not a verdict on the test's failure list
+  // entry, if any.  The entry counts as seen and matched, so that Finalize()
+  // doesn't report it and SaveFailureList() keeps it, but the skip is not an
+  // expected failure.  A listed test that is skipped is also recorded for
+  // ListedSkips().
   absl::Status ReportSkip(absl::string_view test_name,
                           absl::string_view skip_reason);
 
-  // Reports a test the runner didn't run because it wasn't selected.  Its
-  // response was skipped with kTestNotSelectedSkipReason, added with the
-  // matchers in the next CL.  The original conformance_test_runner matches a
-  // test name against the failure list before checking whether the test was
-  // selected.  Like it, this only marks the entry the name matches, if any, as
-  // matched for UnmatchedExpectedFailures().  The test is not counted by any
-  // statistic and its entry stays unseen.
+  // Reports a test the runner didn't run because it wasn't selected.
+  // The original conformance_test_runner matches a test name against the
+  // failure list before checking whether the test was selected.  Like it,
+  // this only marks the entry the name matches, if any, as matched for
+  // UnmatchedExpectedFailures().  The test is not counted by any statistic
+  // and its entry stays unseen.
   // TODO: b/563707827 - Remove with conformance_test_runner.
   void ReportNotSelected(absl::string_view test_name);
+
+  // Records `record`, the outcome Yields() recorded for `test_name`, through
+  // the Report*() method for its status.  The verdict was applied when the
+  // result was checked, so it is dropped here.
+  void Report(absl::string_view test_name, const ResultRecord& record);
+
+  // Whether any of the Report*() methods has been called for `test_name`.
+  // The test environment checks this when it replays the recorded outcomes
+  // (see Report()), so that a test is counted once.
+  bool WasReported(absl::string_view test_name) const {
+    return seen_tests_.contains(test_name);
+  }
+
+  // The sorted failure list entries that more than kMaximumWildcardExpansions
+  // reported tests matched with a verdict, that is as an expected failure or
+  // an unexpected success.  Skips don't count.  Such a wildcard hides too
+  // much; the test environment fails the run over it.
+  std::vector<std::string> OverexpandedWildcards() const;
 
   // Runs sanity checks over the failure list to make sure everything we
   // expected to run was reported.  Returns an error naming the sorted expected
@@ -136,7 +205,7 @@ class TestManager {
   // Returns the tests the testee skipped although they are in the failure
   // list, sorted by test name.  These are the tests listed_skips() counts.
   // Each pair is the test name and the failure list entry it matched.  Such a
-  // test fails the gtest run: the matchers, next CL, fail it with the error
+  // test fails the gtest run: the matchers fail it with the error
   // ReportSkip() returns.  It is not an unexpected failure or success.  Its
   // entry is kept as is, also by SaveFailureList() under --fix, so removing
   // the entry is up to the user.
@@ -191,10 +260,12 @@ class TestManager {
   // Entries never matched by name by any Report*() call.
   absl::flat_hash_set<std::string> unmatched_expected_failures_;
   absl::flat_hash_set<std::string> seen_unexpected_successes_;
+  // How many tests matched each entry as an expected failure or an unexpected
+  // success.  See OverexpandedWildcards().
   absl::flat_hash_map<std::string, int> number_of_matches_;
 
-  // Every test name reported so far, so that a test reported more than once
-  // is only counted once.  The matchers prevent that, but nothing else does.
+  // Every test name reported so far (see WasReported()), so that a test
+  // reported more than once is only counted once.
   absl::flat_hash_set<std::string> seen_tests_;
 
   // The tests counted by unexpected_failures_, mapped to their formatted
