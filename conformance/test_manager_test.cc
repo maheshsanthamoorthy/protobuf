@@ -15,6 +15,8 @@
 #include "absl/strings/str_cat.h"
 #include "absl/strings/string_view.h"
 #include "absl/types/optional.h"
+#include "conformance/failure_list.h"
+#include "conformance/result_record.h"
 #include "conformance/testee.h"
 
 namespace google {
@@ -180,6 +182,121 @@ TEST_F(TestManagerTest, ReportNotSelected) {
   EXPECT_EQ(manager.unexpected_successes(), 0);
   EXPECT_EQ(manager.skipped(), 0);
   EXPECT_EQ(manager.tolerated_failures(), 0);
+}
+
+TEST_F(TestManagerTest, WasReported) {
+  CreateFailureList({});
+  TestManager manager;
+  ASSERT_THAT(manager.LoadFailureList(failure_list()), IsOk());
+  EXPECT_FALSE(manager.WasReported("success"));
+
+  EXPECT_THAT(manager.ReportSuccess("success"), IsOk());
+  EXPECT_THAT(manager.ReportFailure("failure", kP0, "abc"), Not(IsOk()));
+  EXPECT_THAT(manager.ReportSkip("skip", "reason"), IsOk());
+  manager.ReportNotSelected("not_selected");
+
+  EXPECT_TRUE(manager.WasReported("success"));
+  EXPECT_TRUE(manager.WasReported("failure"));
+  EXPECT_TRUE(manager.WasReported("skip"));
+  EXPECT_TRUE(manager.WasReported("not_selected"));
+  EXPECT_FALSE(manager.WasReported("other"));
+  EXPECT_THAT(manager.Finalize(), IsOk());
+}
+
+TEST_F(TestManagerTest, FailureListVerdictsRecordNothing) {
+  CreateFailureList({{"foo", "abc"}, {"bar.*", "abc"}, {"baz", "abc"}});
+  TestManager manager;
+  ASSERT_THAT(manager.LoadFailureList(failure_list()), IsOk());
+  manager.set_enforcement_level(0);
+
+  const FailureList& failure_list = manager.failure_list();
+  EXPECT_THAT(failure_list.VerdictOnSuccess("unlisted"), IsOk());
+  EXPECT_THAT(failure_list.VerdictOnSuccess("foo"),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       "test foo (matched to foo) is in the failure list, but "
+                       "test succeeded.  Remove its match from the failure "
+                       "list."));
+  EXPECT_THAT(failure_list.VerdictOnFailure("foo", kP0, "abc"), IsOk());
+  EXPECT_THAT(failure_list.VerdictOnFailure("foo", kP0, "xyz"),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       "Unexpected failure message for test: foo expected: "
+                       "abc actual: xyz"));
+  EXPECT_THAT(failure_list.VerdictOnFailure("bar.x", kP1, "abc"), IsOk());
+  EXPECT_THAT(failure_list.VerdictOnFailure("unlisted", kP0, "xyz"),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       "Unexpected failure for test: unlisted"));
+  EXPECT_THAT(failure_list.VerdictOnFailure("unlisted", kP1, "xyz"), IsOk());
+  EXPECT_THAT(failure_list.VerdictOnSkip("unlisted", "reason"), IsOk());
+  EXPECT_THAT(failure_list.VerdictOnSkip("bar.x", "reason"),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       "test bar.x (matched to bar.*) is in the failure list "
+                       "but was skipped by the testee: reason.  Remove its "
+                       "match from the failure list."));
+
+  // Nothing was reported.
+  EXPECT_FALSE(manager.WasReported("foo"));
+  EXPECT_FALSE(manager.WasReported("unlisted"));
+  EXPECT_THAT(manager.UnmatchedExpectedFailures(),
+              ElementsAre("bar.*", "baz", "foo"));
+  EXPECT_THAT(manager.Finalize(),
+              StatusIs(absl::StatusCode::kFailedPrecondition,
+                       HasSubstr("were not seen: bar.*, baz, foo")));
+  EXPECT_EQ(manager.expected_failures(), 0);
+  EXPECT_EQ(manager.unexpected_failures(), 0);
+  EXPECT_EQ(manager.expected_successes(), 0);
+  EXPECT_EQ(manager.unexpected_successes(), 0);
+  EXPECT_EQ(manager.skipped(), 0);
+  EXPECT_EQ(manager.tolerated_failures(), 0);
+}
+
+TEST_F(TestManagerTest, FailureListLookupsRecordNothing) {
+  CreateFailureList({{"foo", "abc"}, {"bar.*", "abc"}});
+  TestManager manager;
+  ASSERT_THAT(manager.LoadFailureList(failure_list()), IsOk());
+
+  const FailureList& failure_list = manager.failure_list();
+  EXPECT_THAT(failure_list.MatchingEntry("foo"), Optional(std::string("foo")));
+  EXPECT_THAT(failure_list.MatchingEntry("bar.x"),
+              Optional(std::string("bar.*")));
+  EXPECT_EQ(failure_list.MatchingEntry("foo.x"), absl::nullopt);
+  EXPECT_EQ(failure_list.MatchingEntry("unlisted"), absl::nullopt);
+  EXPECT_THAT(failure_list.ExpectedMessage("foo"),
+              Optional(std::string("abc")));
+  EXPECT_THAT(failure_list.ExpectedMessage("bar.*"),
+              Optional(std::string("abc")));
+  // Entries are looked up as listed, not matched.
+  EXPECT_EQ(failure_list.ExpectedMessage("bar.x"), absl::nullopt);
+
+  // Looking up a name doesn't match its entry.
+  EXPECT_THAT(manager.UnmatchedExpectedFailures(), ElementsAre("bar.*", "foo"));
+  manager.Finalize().IgnoreError();
+}
+
+TEST_F(TestManagerTest, ReportRecordDispatchesOnTheStatus) {
+  CreateFailureList({{"fail", "abc"}, {"crash", "abc"}, {"skip", "abc"}});
+  TestManager manager;
+  ASSERT_THAT(manager.LoadFailureList(failure_list()), IsOk());
+
+  manager.Report("pass", {kP0, ResultRecord::Status::kPass, ""});
+  manager.Report("fail", {kP0, ResultRecord::Status::kFail, "abc"});
+  manager.Report("crash", {kP0, ResultRecord::Status::kCrash, "xyz"});
+  manager.Report("skip", {kP0, ResultRecord::Status::kSkip, "reason"});
+  // The verdict is dropped: a tolerated failure is recorded like any other.
+  manager.set_enforcement_level(0);
+  manager.Report("tolerated", {kP1, ResultRecord::Status::kFail, "xyz"});
+
+  EXPECT_TRUE(manager.WasReported("pass"));
+  EXPECT_EQ(manager.expected_successes(), 1);
+  EXPECT_EQ(manager.expected_failures(), 1);
+  EXPECT_THAT(manager.UnexpectedFailures(),
+              ElementsAre(FieldsAre("crash", "xyz", absl::nullopt)));
+  EXPECT_EQ(manager.unexpected_failures(), 1);
+  EXPECT_THAT(manager.ListedSkips(), ElementsAre(Pair("skip", "skip")));
+  EXPECT_EQ(manager.skipped(), 1);
+  EXPECT_EQ(manager.tolerated_failures(), 1);
+  EXPECT_EQ(manager.unexpected_successes(), 0);
+  // What Finalize() makes of the entries is the Report*() tests' business.
+  manager.Finalize().IgnoreError();
 }
 
 TEST_F(TestManagerTest, ReportExpectedFailure) {
@@ -471,7 +588,7 @@ TEST_F(TestManagerTest, UnexpectedFailures) {
   EXPECT_THAT(manager.Finalize(), IsOk());
 }
 
-TEST_F(TestManagerTest, UnexpectedFailuresIncludeExceededWildcardMatches) {
+TEST_F(TestManagerTest, OverexpandedWildcardKeepsMatching) {
   CreateFailureList({{"foo.*.bar"}});
   TestManager manager;
   ASSERT_THAT(manager.LoadFailureList(failure_list()), IsOk());
@@ -480,11 +597,14 @@ TEST_F(TestManagerTest, UnexpectedFailuresIncludeExceededWildcardMatches) {
     ASSERT_THAT(manager.ReportSuccess(absl::StrCat("foo.", i, ".bar")),
                 Not(IsOk()));
   }
-  ASSERT_THAT(manager.ReportFailure("foo.baz.bar", kP0, "msg"), Not(IsOk()));
+  // The entry is far over the cap, but the verdicts don't change: the test
+  // environment fails the run over OverexpandedWildcards() instead.
+  ASSERT_THAT(manager.ReportFailure("foo.baz.bar", kP0, "msg"), IsOk());
 
-  EXPECT_THAT(manager.UnexpectedFailures(),
-              ElementsAre(FieldsAre("foo.baz.bar", "msg", absl::nullopt)));
-  EXPECT_EQ(manager.unexpected_failures(), 1);
+  EXPECT_THAT(manager.OverexpandedWildcards(), ElementsAre("foo.*.bar"));
+  EXPECT_THAT(manager.UnexpectedFailures(), IsEmpty());
+  EXPECT_EQ(manager.expected_failures(), 1);
+  EXPECT_EQ(manager.unexpected_failures(), 0);
   EXPECT_THAT(manager.UnexpectedSuccesses(), SizeIs(100));
   EXPECT_EQ(manager.unexpected_successes(), 100);
   EXPECT_THAT(manager.Finalize(), IsOk());
@@ -531,26 +651,34 @@ TEST_F(TestManagerTest, UnexpectedSuccesses) {
   EXPECT_THAT(manager.Finalize(), IsOk());
 }
 
-TEST_F(TestManagerTest, ReportUnexpectedFailureTooManyWildcardMatches) {
-  CreateFailureList({{"foo.*.bar"}});
+TEST_F(TestManagerTest, OverexpandedWildcards) {
+  CreateFailureList({{"foo.*.bar", "abc"}, {"baz.*", "abc"}});
   TestManager manager;
   ASSERT_THAT(manager.LoadFailureList(failure_list()), IsOk());
 
-  for (int i = 0; i < 100; ++i) {
-    EXPECT_THAT(manager.ReportSuccess(absl::StrCat("foo.", i, ".bar")),
-                StatusIs(absl::StatusCode::kFailedPrecondition));
+  // Expected failures and unexpected successes count toward the cap, each
+  // test once however often it is reported.
+  for (int i = 0; i < kMaximumWildcardExpansions; ++i) {
+    ASSERT_THAT(
+        manager.ReportFailure(absl::StrCat("foo.", i, ".bar"), kP0, "abc"),
+        IsOk());
+    ASSERT_THAT(manager.ReportSuccess(absl::StrCat("baz.", i)), Not(IsOk()));
   }
-  ASSERT_THAT(manager.ReportFailure("foo.baz.bar", kP0, ""),
-              StatusIs(absl::StatusCode::kFailedPrecondition,
-                       AllOf(HasSubstr("too many test names"),
-                             HasSubstr("foo.baz.bar"))));
+  ASSERT_THAT(manager.ReportFailure("foo.0.bar", kP0, "abc"), IsOk());
+  ASSERT_THAT(manager.ReportSuccess("baz.0"), Not(IsOk()));
+  EXPECT_THAT(manager.OverexpandedWildcards(), IsEmpty());
 
+  // Skips and failures with another message don't count.
+  ASSERT_THAT(manager.ReportSkip("foo.skip.bar", "reason"), Not(IsOk()));
+  ASSERT_THAT(manager.ReportFailure("foo.other.bar", kP0, "xyz"), Not(IsOk()));
+  EXPECT_THAT(manager.OverexpandedWildcards(), IsEmpty());
+
+  // One more verdict puts an entry over the cap.  The list is sorted.
+  ASSERT_THAT(manager.ReportFailure("foo.more.bar", kP0, "abc"), IsOk());
+  ASSERT_THAT(manager.ReportSuccess("baz.more"), Not(IsOk()));
+  EXPECT_THAT(manager.OverexpandedWildcards(),
+              ElementsAre("baz.*", "foo.*.bar"));
   EXPECT_THAT(manager.Finalize(), IsOk());
-  EXPECT_EQ(manager.expected_failures(), 0);
-  EXPECT_EQ(manager.unexpected_failures(), 1);
-  EXPECT_EQ(manager.expected_successes(), 0);
-  EXPECT_EQ(manager.unexpected_successes(), 100);
-  EXPECT_EQ(manager.skipped(), 0);
 }
 
 TEST_F(TestManagerTest, LoadFailureListInvalidFile) {
